@@ -10,6 +10,7 @@ FLOOR_BOUNCE = 0.8
 WALL_BOUNCE = 0.35
 FRICTION_SURFACE = 0.985
 ANGULAR_DAMPING = 0.98
+SUB_STEPS = 5  # Sub-steps per frame to prevent tunneling through walls
 
 BG_COLOR = (15, 15, 25)
 WALL_COLOR = (200, 200, 220)
@@ -48,7 +49,7 @@ class PhysicsObject:
             pts.append(pygame.Vector2(px, py))
         return pts
 
-    def update(self):
+    def update_substep(self, dt_gravity):
         if self.is_dragging:
             mx, my = pygame.mouse.get_pos()
             self.vx = (mx - self.x) * 0.4
@@ -56,28 +57,49 @@ class PhysicsObject:
             self.x, self.y = mx, my
             self.va = 0
         else:
-            self.vy += GRAVITY
-            self.x += self.vx
-            self.y += self.vy
-            self.angle += self.va
-            self.va *= ANGULAR_DAMPING
-
-        # Floor Collision
-        verts = self.get_vertices()
-        for v in verts:
-            if v.y > HEIGHT:
-                overlap = v.y - HEIGHT
-                self.y -= overlap
-                if self.vy > 0:
-                    self.vy *= -FLOOR_BOUNCE
-                    self.vx *= FRICTION_SURFACE
-                    self.va += self.vx * 0.005 # Spin on floor impact
-                break
+            self.vy += dt_gravity
+            self.x += self.vx / SUB_STEPS
+            self.y += self.vy / SUB_STEPS
+            self.angle += self.va / SUB_STEPS
+            self.va *= (ANGULAR_DAMPING ** (1 / SUB_STEPS))
 
     def draw(self, surface):
         verts = self.get_vertices()
         pygame.draw.polygon(surface, self.color, verts)
         pygame.draw.polygon(surface, (255, 255, 255), verts, 2)
+
+def solve_screen_bounds(obj):
+    # Collide with all 4 window borders
+    verts = obj.get_vertices()
+    for v in verts:
+        # Left Border
+        if v.x < 0:
+            overlap = 0 - v.x
+            obj.x += overlap
+            if obj.vx < 0:
+                obj.vx *= -WALL_BOUNCE
+                obj.vy *= FRICTION_SURFACE
+        # Right Border
+        elif v.x > WIDTH:
+            overlap = v.x - WIDTH
+            obj.x -= overlap
+            if obj.vx > 0:
+                obj.vx *= -WALL_BOUNCE
+                obj.vy *= FRICTION_SURFACE
+        # Top Border
+        if v.y < 0:
+            overlap = 0 - v.y
+            obj.y += overlap
+            if obj.vy < 0:
+                obj.vy *= -WALL_BOUNCE
+        # Bottom Floor
+        elif v.y > HEIGHT:
+            overlap = v.y - HEIGHT
+            obj.y -= overlap
+            if obj.vy > 0:
+                obj.vy *= -FLOOR_BOUNCE
+                obj.vx *= FRICTION_SURFACE
+                obj.va += obj.vx * 0.002
 
 def solve_collision(obj1, obj2):
     v1, v2 = obj1.get_vertices(), obj2.get_vertices()
@@ -148,13 +170,13 @@ def solve_wall_collision(obj, walls):
                 dist_vec = v - closest
                 dist = dist_vec.length()
                 
-                if dist < 6.0 or dist_vec.dot(wall_normal) < 0:
+                if dist < 8.0 or dist_vec.dot(wall_normal) < 0:
                     normal = wall_normal if dist_vec.dot(wall_normal) >= 0 else -wall_normal
                     if dist_vec.length() > 0:
                         normal = dist_vec.normalize()
                     
-                    obj.x += normal.x * 2.0
-                    obj.y += normal.y * 2.0
+                    obj.x += normal.x * 2.5
+                    obj.y += normal.y * 2.5
                     
                     vel = pygame.Vector2(obj.vx, obj.vy)
                     vel_dot_n = vel.dot(normal)
@@ -167,7 +189,7 @@ def solve_wall_collision(obj, walls):
                         obj.vx *= FRICTION_SURFACE
                         obj.vy *= FRICTION_SURFACE
                         
-                        obj.va += vel_t * 0.015 # Realistic spin when hitting walls
+                        obj.va += vel_t * 0.015
 
 def get_closest_wall(m_pos, walls):
     closest_idx = -1
@@ -222,7 +244,6 @@ def main():
                 if event.key in shape_map:
                     objects.append(PhysicsObject(m_pos.x, m_pos.y, 25, 1, random.choice(COLORS), shape_map[event.key]))
                 elif event.key == pygame.K_e:
-                    # Delete shape under cursor when 'E' is pressed
                     for o in reversed(objects):
                         if (pygame.Vector2(o.x, o.y) - m_pos).length() < o.size:
                             objects.remove(o)
@@ -230,12 +251,17 @@ def main():
                 elif event.key == pygame.K_c: 
                     objects.clear(); walls.clear()
 
-        # Update Physics
-        for i, o1 in enumerate(objects):
-            o1.update()
-            for o2 in objects[i+1:]: 
-                solve_collision(o1, o2)
-            solve_wall_collision(o1, walls)
+        # Physics Sub-Stepping Loop
+        dt_gravity = GRAVITY / SUB_STEPS
+        for _ in range(SUB_STEPS):
+            for o1 in objects:
+                o1.update_substep(dt_gravity)
+                solve_screen_bounds(o1)
+                solve_wall_collision(o1, walls)
+
+            for i, o1 in enumerate(objects):
+                for o2 in objects[i+1:]: 
+                    solve_collision(o1, o2)
 
         # Draw Walls
         for i, (p1, p2) in enumerate(walls):
@@ -252,7 +278,7 @@ def main():
         ui = [
             "1-6: Spawn Shapes | E: Delete Shape under cursor",
             "Left Click: Drag shapes / Delete wall | Right Click: Draw Wall",
-            "C: Clear All | Polygon Wall Collisions & Angular Spin Active!"
+            "C: Clear All | Full Window & Custom Wall Collisions Active!"
         ]
         for i, text in enumerate(ui):
             screen.blit(font.render(text, True, (200, 200, 200)), (20, 20 + i * 20))
