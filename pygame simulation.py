@@ -7,10 +7,10 @@ WIDTH, HEIGHT = 900, 700
 FPS = 60
 GRAVITY = 0.45
 FLOOR_BOUNCE = 0.8
-WALL_BOUNCE = 0.35
+WALL_BOUNCE = 0.4
 FRICTION_SURFACE = 0.985
 ANGULAR_DAMPING = 0.98
-SUB_STEPS = 5  # Sub-steps per frame for smooth physics
+SUB_STEPS = 4  # Balanced sub-steps for smooth, lag-free performance
 
 BG_COLOR = (15, 15, 25)
 WALL_COLOR = (200, 200, 220)
@@ -28,12 +28,13 @@ class PhysicsObject:
         self.angle = 0
         self.va = 0 
         self.is_dragging = False
+        self.cached_verts = []
 
     @property
     def inertia(self):
         return 0.5 * self.mass * (self.size ** 2)
 
-    def get_vertices(self):
+    def update_vertices(self):
         pts = []
         sides_map = {"triangle": 3, "square": 4, "pentagon": 5, "hexagon": 6, "octagon": 8, "circle": 16}
         sides = sides_map.get(self.shape, 4)
@@ -47,7 +48,7 @@ class PhysicsObject:
             px = self.x + math.cos(ang) * (self.size * scale)
             py = self.y + math.sin(ang) * (self.size * scale)
             pts.append(pygame.Vector2(px, py))
-        return pts
+        self.cached_verts = pts
 
     def update_substep(self, dt_gravity):
         if self.is_dragging:
@@ -64,12 +65,10 @@ class PhysicsObject:
             self.va *= (ANGULAR_DAMPING ** (1 / SUB_STEPS))
 
     def draw(self, surface):
-        verts = self.get_vertices()
-        pygame.draw.polygon(surface, self.color, verts)
-        pygame.draw.polygon(surface, (255, 255, 255), verts, 2)
+        pygame.draw.polygon(surface, self.color, self.cached_verts)
+        pygame.draw.polygon(surface, (255, 255, 255), self.cached_verts, 2)
 
 def solve_screen_bounds(obj):
-    # Stable boundary clamping using object size to prevent force compounding
     if obj.x - obj.size < 0:
         obj.x = obj.size
         if obj.vx < 0: obj.vx *= -WALL_BOUNCE
@@ -88,7 +87,7 @@ def solve_screen_bounds(obj):
             obj.va += obj.vx * 0.002
 
 def solve_collision(obj1, obj2):
-    v1, v2 = obj1.get_vertices(), obj2.get_vertices()
+    v1, v2 = obj1.cached_verts, obj2.cached_verts
     axes = []
     for verts in [v1, v2]:
         for i in range(len(verts)):
@@ -115,11 +114,11 @@ def solve_collision(obj1, obj2):
         ratio1 = obj2.mass / total_mass
         ratio2 = obj1.mass / total_mass
         
-        # Positional correction
-        obj1.x += smallest_axis.x * min_overlap * ratio1
-        obj1.y += smallest_axis.y * min_overlap * ratio1
-        obj2.x -= smallest_axis.x * min_overlap * ratio2
-        obj2.y -= smallest_axis.y * min_overlap * ratio2
+        correction = min_overlap * 0.5
+        obj1.x += smallest_axis.x * correction * ratio1
+        obj1.y += smallest_axis.y * correction * ratio1
+        obj2.x -= smallest_axis.x * correction * ratio2
+        obj2.y -= smallest_axis.y * correction * ratio2
         
         normal = smallest_axis
         relative_vel = pygame.Vector2(obj1.vx - obj2.vx, obj1.vy - obj2.vy)
@@ -135,12 +134,10 @@ def solve_collision(obj1, obj2):
             obj2.vx -= (impulse.x / obj2.mass)
             obj2.vy -= (impulse.y / obj2.mass)
             
-            # Transfer angular momentum / torque
             obj1.va += (impulse.x * 0.02) / (obj1.inertia / obj1.mass)
             obj2.va -= (impulse.x * 0.02) / (obj2.inertia / obj2.mass)
 
 def solve_wall_collision(obj, walls):
-    verts = obj.get_vertices()
     for p1, p2 in walls:
         line_vec = p2 - p1
         line_len = line_vec.length()
@@ -148,40 +145,46 @@ def solve_wall_collision(obj, walls):
         line_dir = line_vec / line_len
         wall_normal = pygame.Vector2(-line_dir.y, line_dir.x)
         
-        deepest_penetration = 0
-        collision_normal = None
-        hit = False
-        
-        # Find deepest penetrating vertex to resolve cleanly once per wall
-        for v in verts:
+        for v in obj.cached_verts:
             v_vec = v - p1
             t = v_vec.dot(line_dir)
             if 0 <= t <= line_len:
                 closest = p1 + t * line_dir
                 dist_vec = v - closest
+                dist = dist_vec.length()
                 
-                if dist_vec.dot(wall_normal) < 0:
-                    penetration = dist_vec.length()
-                    if penetration > deepest_penetration:
-                        deepest_penetration = penetration
-                        collision_normal = wall_normal
-                        hit = True
+                if dist < 4.0 or dist_vec.dot(wall_normal) < 0:
+                    normal = wall_normal if dist_vec.dot(wall_normal) >= 0 else -wall_normal
+                    if dist > 0:
+                        normal = dist_vec.normalize()
+                    
+                    # Calculate velocity at the specific contact vertex (incorporating rotation/torque)
+                    r = v - pygame.Vector2(obj.x, obj.y)
+                    v_vert = pygame.Vector2(obj.vx - obj.va * r.y, obj.vy + obj.va * r.x)
+                    vel_along_normal = v_vert.dot(normal)
+                    
+                    if vel_along_normal < 0:
+                        # True impulse-momentum response with rotational torque
+                        r_cross_n = r.x * normal.y - r.y * normal.x
+                        inv_inertia = 1.0 / obj.inertia
+                        denominator = (1.0 / obj.mass) + (r_cross_n * r_cross_n) * inv_inertia
                         
-        if hit and collision_normal:
-            obj.x += collision_normal.x * (deepest_penetration + 0.5)
-            obj.y += collision_normal.y * (deepest_penetration + 0.5)
-            
-            vel = pygame.Vector2(obj.vx, obj.vy)
-            vel_dot_n = vel.dot(collision_normal)
-            if vel_dot_n < 0:
-                tangent = pygame.Vector2(-collision_normal.y, collision_normal.x)
-                vel_t = vel.dot(tangent)
-                
-                obj.vx -= (1 + WALL_BOUNCE) * vel_dot_n * collision_normal.x
-                obj.vy -= (1 + WALL_BOUNCE) * vel_dot_n * collision_normal.y
-                obj.vx *= FRICTION_SURFACE
-                obj.vy *= FRICTION_SURFACE
-                obj.va += vel_t * 0.005
+                        if denominator > 0:
+                            impulse_scalar = -(1.0 + WALL_BOUNCE) * vel_along_normal / denominator
+                            impulse = normal * impulse_scalar
+                            
+                            # Apply velocity change naturally (no teleporting/snapping)
+                            obj.vx += impulse.x / obj.mass
+                            obj.vy += impulse.y / obj.mass
+                            
+                            torque = r.x * impulse.y - r.y * impulse.x
+                            obj.va += torque * inv_inertia
+                            
+                            # Extremely minor nudge only to prevent deep sinking
+                            penetration = 3.0 - dist
+                            if penetration > 0:
+                                obj.x += normal.x * penetration * 0.1
+                                obj.y += normal.y * penetration * 0.1
 
 def get_closest_wall(m_pos, walls):
     closest_idx = -1
@@ -243,6 +246,10 @@ def main():
                 elif event.key == pygame.K_c: 
                     objects.clear(); walls.clear()
 
+        # Update cached vertices once before physics loop
+        for o in objects:
+            o.update_vertices()
+
         # Physics Sub-Stepping Loop
         dt_gravity = GRAVITY / SUB_STEPS
         for _ in range(SUB_STEPS):
@@ -250,10 +257,19 @@ def main():
                 o1.update_substep(dt_gravity)
                 solve_screen_bounds(o1)
                 solve_wall_collision(o1, walls)
+                o1.update_vertices()
 
+            # Broad-Phase Optimized Object-to-Object Collisions
             for i, o1 in enumerate(objects):
                 for o2 in objects[i+1:]: 
-                    solve_collision(o1, o2)
+                    dx = o1.x - o2.x
+                    dy = o1.y - o2.y
+                    if dx*dx + dy*dy < (o1.size + o2.size + 15)**2:
+                        solve_collision(o1, o2)
+
+        # Final vertex update for rendering
+        for o in objects:
+            o.update_vertices()
 
         # Draw Walls
         for i, (p1, p2) in enumerate(walls):
@@ -270,7 +286,7 @@ def main():
         ui = [
             "1-6: Spawn Shapes | E: Delete Shape under cursor",
             "Left Click: Drag shapes / Delete wall | Right Click: Draw Wall",
-            "C: Clear All | Stable Wall & Window Collisions Active!"
+            "C: Clear All | True Impulse-Momentum Wall Collisions Active!"
         ]
         for i, text in enumerate(ui):
             screen.blit(font.render(text, True, (200, 200, 200)), (20, 20 + i * 20))
