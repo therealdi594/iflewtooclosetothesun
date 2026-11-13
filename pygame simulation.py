@@ -5,11 +5,11 @@ import math
 # --- Configuration ---
 WIDTH, HEIGHT = 900, 700
 FPS = 60
-GRAVITY = 0.5
-FLOOR_BOUNCE = 0.85    # High bounce for the ground
-WALL_BOUNCE = 0.25     # Low bounce for slopes/walls
-FRICTION_SURFACE = 0.99 
-ANGULAR_DAMPING = 0.96
+GRAVITY = 0.45
+FLOOR_BOUNCE = 0.8
+WALL_BOUNCE = 0.35
+FRICTION_SURFACE = 0.985
+ANGULAR_DAMPING = 0.98
 
 BG_COLOR = (15, 15, 25)
 WALL_COLOR = (200, 200, 220)
@@ -27,6 +27,10 @@ class PhysicsObject:
         self.angle = 0
         self.va = 0 
         self.is_dragging = False
+
+    @property
+    def inertia(self):
+        return 0.5 * self.mass * (self.size ** 2)
 
     def get_vertices(self):
         pts = []
@@ -50,6 +54,7 @@ class PhysicsObject:
             self.vx = (mx - self.x) * 0.4
             self.vy = (my - self.y) * 0.4
             self.x, self.y = mx, my
+            self.va = 0
         else:
             self.vy += GRAVITY
             self.x += self.vx
@@ -57,7 +62,7 @@ class PhysicsObject:
             self.angle += self.va
             self.va *= ANGULAR_DAMPING
 
-        # FLOOR COLLISION (High Bounce)
+        # Floor Collision
         verts = self.get_vertices()
         for v in verts:
             if v.y > HEIGHT:
@@ -65,9 +70,9 @@ class PhysicsObject:
                 self.y -= overlap
                 if self.vy > 0:
                     self.vy *= -FLOOR_BOUNCE
-                    # Add some rotation based on horizontal speed on impact
-                    self.va += self.vx * 0.01 
-                break # Only need to bounce once per frame
+                    self.vx *= FRICTION_SURFACE
+                    self.va += self.vx * 0.005 # Spin on floor impact
+                break
 
     def draw(self, surface):
         verts = self.get_vertices()
@@ -84,7 +89,7 @@ def solve_collision(obj1, obj2):
             if edge.length() > 0:
                 axes.append(pygame.Vector2(-edge.y, edge.x).normalize())
     
-    min_overlap = 999999
+    min_overlap = float('inf')
     smallest_axis = None
     for axis in axes:
         dots1 = [v.dot(axis) for v in v1]
@@ -97,26 +102,76 @@ def solve_collision(obj1, obj2):
     if smallest_axis:
         d = pygame.Vector2(obj1.x - obj2.x, obj1.y - obj2.y)
         if d.dot(smallest_axis) < 0: smallest_axis *= -1
-        obj1.x += smallest_axis.x * min_overlap * 0.5
-        obj1.y += smallest_axis.y * min_overlap * 0.5
-        obj2.x -= smallest_axis.x * min_overlap * 0.5
-        obj2.y -= smallest_axis.y * min_overlap * 0.5
+        
+        total_mass = obj1.mass + obj2.mass
+        ratio1 = obj2.mass / total_mass
+        ratio2 = obj1.mass / total_mass
+        
+        # Positional correction
+        obj1.x += smallest_axis.x * min_overlap * ratio1
+        obj1.y += smallest_axis.y * min_overlap * ratio1
+        obj2.x -= smallest_axis.x * min_overlap * ratio2
+        obj2.y -= smallest_axis.y * min_overlap * ratio2
         
         normal = smallest_axis
         relative_vel = pygame.Vector2(obj1.vx - obj2.vx, obj1.vy - obj2.vy)
         vel_along_normal = relative_vel.dot(normal)
+        
         if vel_along_normal < 0:
-            # Objects bouncing off each other (Medium bounce)
-            mid_bounce = (FLOOR_BOUNCE + WALL_BOUNCE) / 2
-            impulse = (-(1 + mid_bounce) * vel_along_normal) / 2
-            obj1.vx += impulse * normal.x
-            obj1.vy += impulse * normal.y
-            obj2.vx -= impulse * normal.x
-            obj2.vy -= impulse * normal.y
+            restitution = (FLOOR_BOUNCE + WALL_BOUNCE) / 2
+            impulse_scalar = -(1 + restitution) * vel_along_normal / (1/obj1.mass + 1/obj2.mass)
+            
+            impulse = normal * impulse_scalar
+            obj1.vx += (impulse.x / obj1.mass)
+            obj1.vy += (impulse.y / obj1.mass)
+            obj2.vx -= (impulse.x / obj2.mass)
+            obj2.vy -= (impulse.y / obj2.mass)
+            
+            # Transfer angular momentum / torque
+            obj1.va += (impulse.x * 0.02) / (obj1.inertia / obj1.mass)
+            obj2.va -= (impulse.x * 0.02) / (obj2.inertia / obj2.mass)
+
+def solve_wall_collision(obj, walls):
+    verts = obj.get_vertices()
+    for p1, p2 in walls:
+        line_vec = p2 - p1
+        line_len = line_vec.length()
+        if line_len == 0: continue
+        line_dir = line_vec / line_len
+        wall_normal = pygame.Vector2(-line_dir.y, line_dir.x)
+        
+        for v in verts:
+            v_vec = v - p1
+            t = v_vec.dot(line_dir)
+            if 0 <= t <= line_len:
+                closest = p1 + t * line_dir
+                dist_vec = v - closest
+                dist = dist_vec.length()
+                
+                if dist < 6.0 or dist_vec.dot(wall_normal) < 0:
+                    normal = wall_normal if dist_vec.dot(wall_normal) >= 0 else -wall_normal
+                    if dist_vec.length() > 0:
+                        normal = dist_vec.normalize()
+                    
+                    obj.x += normal.x * 2.0
+                    obj.y += normal.y * 2.0
+                    
+                    vel = pygame.Vector2(obj.vx, obj.vy)
+                    vel_dot_n = vel.dot(normal)
+                    if vel_dot_n < 0:
+                        tangent = pygame.Vector2(-normal.y, normal.x)
+                        vel_t = vel.dot(tangent)
+                        
+                        obj.vx -= (1 + WALL_BOUNCE) * vel_dot_n * normal.x
+                        obj.vy -= (1 + WALL_BOUNCE) * vel_dot_n * normal.y
+                        obj.vx *= FRICTION_SURFACE
+                        obj.vy *= FRICTION_SURFACE
+                        
+                        obj.va += vel_t * 0.015 # Realistic spin when hitting walls
 
 def get_closest_wall(m_pos, walls):
     closest_idx = -1
-    min_dist = 6 
+    min_dist = 8 
     for i, (p1, p2) in enumerate(walls):
         line_vec = p2 - p1
         if line_vec.length() == 0: continue
@@ -138,7 +193,7 @@ def main():
     drag_obj, w_start = None, None
 
     while True:
-        m_pos = pygame.mouse.get_pos()
+        m_pos = pygame.Vector2(pygame.mouse.get_pos())
         screen.fill(BG_COLOR)
         hover_wall_idx = get_closest_wall(m_pos, walls)
 
@@ -149,7 +204,7 @@ def main():
                 if event.button == 1:
                     hit_shape = False
                     for o in reversed(objects):
-                        if (pygame.Vector2(o.x, o.y) - pygame.Vector2(m_pos)).length() < o.size:
+                        if (pygame.Vector2(o.x, o.y) - m_pos).length() < o.size:
                             o.is_dragging = True; drag_obj = o; hit_shape = True; break
                     if not hit_shape and hover_wall_idx != -1:
                         walls.pop(hover_wall_idx)
@@ -165,44 +220,45 @@ def main():
             if event.type == pygame.KEYDOWN:
                 shape_map = {pygame.K_1:"circle", pygame.K_2:"square", pygame.K_3:"triangle", pygame.K_4:"pentagon", pygame.K_5:"hexagon", pygame.K_6:"octagon"}
                 if event.key in shape_map:
-                    objects.append(PhysicsObject(m_pos[0], m_pos[1], 25, 1, random.choice(COLORS), shape_map[event.key]))
-                if event.key == pygame.K_c: objects.clear(); walls.clear()
+                    objects.append(PhysicsObject(m_pos.x, m_pos.y, 25, 1, random.choice(COLORS), shape_map[event.key]))
+                elif event.key == pygame.K_e:
+                    # Delete shape under cursor when 'E' is pressed
+                    for o in reversed(objects):
+                        if (pygame.Vector2(o.x, o.y) - m_pos).length() < o.size:
+                            objects.remove(o)
+                            break
+                elif event.key == pygame.K_c: 
+                    objects.clear(); walls.clear()
 
-        # Update
+        # Update Physics
         for i, o1 in enumerate(objects):
             o1.update()
-            for o2 in objects[i+1:]: solve_collision(o1, o2)
-            
-            # WALL COLLISION (Low Bounce)
-            for p1, p2 in walls:
-                line = p2 - p1
-                if line.length() == 0: continue
-                t = max(0, min(1, (pygame.Vector2(o1.x, o1.y) - p1).dot(line) / line.length_squared()))
-                closest = p1 + t * line
-                dist_vec = pygame.Vector2(o1.x, o1.y) - closest
-                if dist_vec.length() < o1.size:
-                    normal = dist_vec.normalize() if dist_vec.length() > 0 else pygame.Vector2(0, -1)
-                    o1.x += normal.x * (o1.size - dist_vec.length())
-                    o1.y += normal.y * (o1.size - dist_vec.length())
-                    vel_dot_n = pygame.Vector2(o1.vx, o1.vy).dot(normal)
-                    if vel_dot_n < 0:
-                        # Apply specific Wall Bounce here
-                        o1.vx -= (1 + WALL_BOUNCE) * vel_dot_n * normal.x
-                        o1.vy -= (1 + WALL_BOUNCE) * vel_dot_n * normal.y
-                        o1.vx *= FRICTION_SURFACE; o1.vy *= FRICTION_SURFACE
+            for o2 in objects[i+1:]: 
+                solve_collision(o1, o2)
+            solve_wall_collision(o1, walls)
 
-        # Draw
+        # Draw Walls
         for i, (p1, p2) in enumerate(walls):
             color = HOVER_COLOR if i == hover_wall_idx else WALL_COLOR
             pygame.draw.line(screen, color, p1, p2, 5)
-        if w_start: pygame.draw.line(screen, (255, 255, 0), w_start, m_pos, 2)
-        for o in objects: o.draw(screen)
+        if w_start: 
+            pygame.draw.line(screen, (255, 255, 0), w_start, m_pos, 2)
+            
+        # Draw Objects
+        for o in objects: 
+            o.draw(screen)
         
-        ui = ["1-6: Shapes", "Floor: Super Bouncy", "Walls: Low Bounce", "L-Click Wall: Delete"]
+        # UI Instructions
+        ui = [
+            "1-6: Spawn Shapes | E: Delete Shape under cursor",
+            "Left Click: Drag shapes / Delete wall | Right Click: Draw Wall",
+            "C: Clear All | Polygon Wall Collisions & Angular Spin Active!"
+        ]
         for i, text in enumerate(ui):
             screen.blit(font.render(text, True, (200, 200, 200)), (20, 20 + i * 20))
 
         pygame.display.flip()
         clock.tick(FPS)
 
-if __name__ == "__main__": main()
+if __name__ == "__main__": 
+    main()
