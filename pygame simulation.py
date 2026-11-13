@@ -10,7 +10,7 @@ FLOOR_BOUNCE = 0.8
 WALL_BOUNCE = 0.35
 FRICTION_SURFACE = 0.985
 ANGULAR_DAMPING = 0.98
-SUB_STEPS = 5  # Sub-steps per frame to prevent tunneling through walls
+SUB_STEPS = 5  # Sub-steps per frame for smooth physics
 
 BG_COLOR = (15, 15, 25)
 WALL_COLOR = (200, 200, 220)
@@ -69,37 +69,23 @@ class PhysicsObject:
         pygame.draw.polygon(surface, (255, 255, 255), verts, 2)
 
 def solve_screen_bounds(obj):
-    # Collide with all 4 window borders
-    verts = obj.get_vertices()
-    for v in verts:
-        # Left Border
-        if v.x < 0:
-            overlap = 0 - v.x
-            obj.x += overlap
-            if obj.vx < 0:
-                obj.vx *= -WALL_BOUNCE
-                obj.vy *= FRICTION_SURFACE
-        # Right Border
-        elif v.x > WIDTH:
-            overlap = v.x - WIDTH
-            obj.x -= overlap
-            if obj.vx > 0:
-                obj.vx *= -WALL_BOUNCE
-                obj.vy *= FRICTION_SURFACE
-        # Top Border
-        if v.y < 0:
-            overlap = 0 - v.y
-            obj.y += overlap
-            if obj.vy < 0:
-                obj.vy *= -WALL_BOUNCE
-        # Bottom Floor
-        elif v.y > HEIGHT:
-            overlap = v.y - HEIGHT
-            obj.y -= overlap
-            if obj.vy > 0:
-                obj.vy *= -FLOOR_BOUNCE
-                obj.vx *= FRICTION_SURFACE
-                obj.va += obj.vx * 0.002
+    # Stable boundary clamping using object size to prevent force compounding
+    if obj.x - obj.size < 0:
+        obj.x = obj.size
+        if obj.vx < 0: obj.vx *= -WALL_BOUNCE
+    elif obj.x + obj.size > WIDTH:
+        obj.x = WIDTH - obj.size
+        if obj.vx > 0: obj.vx *= -WALL_BOUNCE
+        
+    if obj.y - obj.size < 0:
+        obj.y = obj.size
+        if obj.vy < 0: obj.vy *= -WALL_BOUNCE
+    elif obj.y + obj.size > HEIGHT:
+        obj.y = HEIGHT - obj.size
+        if obj.vy > 0:
+            obj.vy *= -FLOOR_BOUNCE
+            obj.vx *= FRICTION_SURFACE
+            obj.va += obj.vx * 0.002
 
 def solve_collision(obj1, obj2):
     v1, v2 = obj1.get_vertices(), obj2.get_vertices()
@@ -162,34 +148,40 @@ def solve_wall_collision(obj, walls):
         line_dir = line_vec / line_len
         wall_normal = pygame.Vector2(-line_dir.y, line_dir.x)
         
+        deepest_penetration = 0
+        collision_normal = None
+        hit = False
+        
+        # Find deepest penetrating vertex to resolve cleanly once per wall
         for v in verts:
             v_vec = v - p1
             t = v_vec.dot(line_dir)
             if 0 <= t <= line_len:
                 closest = p1 + t * line_dir
                 dist_vec = v - closest
-                dist = dist_vec.length()
                 
-                if dist < 8.0 or dist_vec.dot(wall_normal) < 0:
-                    normal = wall_normal if dist_vec.dot(wall_normal) >= 0 else -wall_normal
-                    if dist_vec.length() > 0:
-                        normal = dist_vec.normalize()
-                    
-                    obj.x += normal.x * 2.5
-                    obj.y += normal.y * 2.5
-                    
-                    vel = pygame.Vector2(obj.vx, obj.vy)
-                    vel_dot_n = vel.dot(normal)
-                    if vel_dot_n < 0:
-                        tangent = pygame.Vector2(-normal.y, normal.x)
-                        vel_t = vel.dot(tangent)
+                if dist_vec.dot(wall_normal) < 0:
+                    penetration = dist_vec.length()
+                    if penetration > deepest_penetration:
+                        deepest_penetration = penetration
+                        collision_normal = wall_normal
+                        hit = True
                         
-                        obj.vx -= (1 + WALL_BOUNCE) * vel_dot_n * normal.x
-                        obj.vy -= (1 + WALL_BOUNCE) * vel_dot_n * normal.y
-                        obj.vx *= FRICTION_SURFACE
-                        obj.vy *= FRICTION_SURFACE
-                        
-                        obj.va += vel_t * 0.015
+        if hit and collision_normal:
+            obj.x += collision_normal.x * (deepest_penetration + 0.5)
+            obj.y += collision_normal.y * (deepest_penetration + 0.5)
+            
+            vel = pygame.Vector2(obj.vx, obj.vy)
+            vel_dot_n = vel.dot(collision_normal)
+            if vel_dot_n < 0:
+                tangent = pygame.Vector2(-collision_normal.y, collision_normal.x)
+                vel_t = vel.dot(tangent)
+                
+                obj.vx -= (1 + WALL_BOUNCE) * vel_dot_n * collision_normal.x
+                obj.vy -= (1 + WALL_BOUNCE) * vel_dot_n * collision_normal.y
+                obj.vx *= FRICTION_SURFACE
+                obj.vy *= FRICTION_SURFACE
+                obj.va += vel_t * 0.005
 
 def get_closest_wall(m_pos, walls):
     closest_idx = -1
@@ -278,7 +270,7 @@ def main():
         ui = [
             "1-6: Spawn Shapes | E: Delete Shape under cursor",
             "Left Click: Drag shapes / Delete wall | Right Click: Draw Wall",
-            "C: Clear All | Full Window & Custom Wall Collisions Active!"
+            "C: Clear All | Stable Wall & Window Collisions Active!"
         ]
         for i, text in enumerate(ui):
             screen.blit(font.render(text, True, (200, 200, 200)), (20, 20 + i * 20))
